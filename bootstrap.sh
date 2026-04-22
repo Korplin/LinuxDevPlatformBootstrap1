@@ -83,7 +83,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     gnupg \
     ca-certificates \
     lsb-release \
-    software-properties-common \
     python3 \
     python3-pip \
     python3-apt \
