@@ -268,16 +268,19 @@
     # ==========================================================================
 
     # ── Branch A: VirtualBox guest ────────────────────────────────────────────
-    - name: "[gpu/vm] Install VirtualBox guest additions and integration tools"
-      ansible.builtin.apt:
-        name:
-          - virtualbox-guest-utils   # shared clipboard, drag & drop, etc.
-          - virtualbox-guest-dkms    # DKMS-managed kernel module
-        state: present
+    - name: "[gpu/vm] VirtualBox guest additions — apt packages not available on Debian 13"
+    ansible.builtin.debug:
+      msg:
+        - "VirtualBox guest packages are not in Debian 13 repos."
+        - "After reboot, install from ISO:"
+        - "  VirtualBox menu → Devices → Insert Guest Additions CD Image"
+        - "  sudo mount /dev/cdrom /mnt"
+        - "  sudo bash /mnt/VBoxLinuxAdditions.run"
+        - "  sudo reboot"
       when: is_virtualbox
-      # NOTE: There can be a version mismatch between these apt packages and
-      # your VirtualBox host version. If display issues occur after reboot,
-      # install Guest Additions from the VirtualBox Devices menu instead.
+    # NOTE: There can be a version mismatch between these apt packages and
+    # your VirtualBox host version. If display issues occur after reboot,
+    # install Guest Additions from the VirtualBox Devices menu instead.
 
     # ── Branch B: KVM/QEMU guest ──────────────────────────────────────────────
     - name: "[gpu/vm] Install KVM/QEMU guest tools and display drivers"
