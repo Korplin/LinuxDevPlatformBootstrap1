@@ -271,7 +271,6 @@
     - name: "[gpu/vm] Install VirtualBox guest additions and integration tools"
       ansible.builtin.apt:
         name:
-          - virtualbox-guest-x11     # 3D acceleration inside VirtualBox
           - virtualbox-guest-utils   # shared clipboard, drag & drop, etc.
           - virtualbox-guest-dkms    # DKMS-managed kernel module
         state: present
