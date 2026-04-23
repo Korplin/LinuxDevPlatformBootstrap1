@@ -481,6 +481,291 @@
       # and iris Mesa driver automatically — no explicit package needed.
       # ignore_errors: true is here as a safety net, not because we expect failure.
 
+
+    # ==========================================================================
+    # SECTION 15 — CURSOR IDE
+    # ==========================================================================
+    #
+    # ── PACKAGING SITUATION ──────────────────────────────────────────────────
+    #
+    # VS Code and Brave publish stable apt repositories. Add the repo once,
+    # run apt install, and apt handles the full lifecycle: install, upgrade,
+    # removal. That is the correct Linux packaging story.
+    #
+    # Cursor does not yet offer a pre-configured apt repo. Their .deb package
+    # registers a Cursor-managed apt source on FIRST APPLICATION LAUNCH — not
+    # on installation. During automated provisioning (headless, no GUI, no
+    # first launch) that repo does not yet exist, so apt upgrade has nothing
+    # to pull from.
+    #
+    # This is a deliberate Cursor packaging decision, not a bug. It is common
+    # among commercial Electron apps that manage their own update channels.
+    # The implementation below works within this constraint correctly.
+    #
+    # ── WHY THE API ENDPOINT, NOT A HARDCODED URL ────────────────────────────
+    #
+    # The prior implementation used a hardcoded download URL:
+    #   curl "https://downloader.cursor.sh/linux/nspkg/x64"
+    #
+    # That domain was decommissioned in early 2026. Every script that had
+    # that URL hardcoded broke on the same day with:
+    #   curl: (6) Could not resolve host
+    # No deprecation warning. No redirect. Silent failure on next provision.
+    #
+    # Cursor exposes a stable download API:
+    #   https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable
+    #
+    # The response is JSON:
+    #   {
+    #     "downloadUrl": "...Cursor-3.x.y-x86_64.AppImage",
+    #     "debUrl":      "...cursor_3.x.y_amd64.deb",
+    #     "rpmUrl":      "...cursor-3.x.y.el8.x86_64.rpm",
+    #     "version":     "3.x.y",
+    #     "commitSha":   "abc123..."
+    #   }
+    #
+    # The API contract is stable. The file URLs it returns change with every
+    # release. This playbook always fetches the current version with zero
+    # maintenance — no URL to update, no version to pin.
+    #
+    # ── WHY .debUrl AND NOT .downloadUrl ─────────────────────────────────────
+    #
+    # .downloadUrl  →  AppImage (self-contained bundle)
+    # .debUrl       →  Debian package
+    #
+    # AppImage is wrong here for three reasons:
+    #   1. No system integration by default — no /usr/bin entry, no .desktop
+    #      launcher, no apt lifecycle.
+    #   2. Requires FUSE2 to run; Debian 13 has FUSE2 compatibility issues
+    #      with certain AppImages.
+    #   3. Students would never receive updates through normal apt upgrade.
+    #
+    # The .deb installs to standard FHS paths (/usr/bin/cursor), creates a
+    # .desktop launcher, and registers the Cursor apt repository for future
+    # updates once the application has been launched once.
+    #
+    # ── WHY jq IS A DECLARED PREREQUISITE ───────────────────────────────────
+    #
+    # The install shell block pipes the API response through jq to extract
+    # .debUrl. If jq is absent, the pipe fails immediately with:
+    #   /bin/sh: jq: command not found
+    # Because set -euo pipefail is active, this exits non-zero and the error
+    # message gives no indication that a missing tool is the cause.
+    #
+    # The prerequisite task below installs jq explicitly via apt before the
+    # shell block runs. jq is in the standard Debian repos; this adds one
+    # idempotent apt task with no side effects.
+    #
+    # ── WHY creates: /usr/bin/cursor ────────────────────────────────────────
+    #
+    # creates: is Ansible's idempotency guard for shell tasks. If the path
+    # exists, the entire block is skipped without executing a single line.
+    # /usr/bin/cursor is the binary path installed by the Cursor .deb —
+    # verified against the actual package contents. This makes the install
+    # a true one-shot: runs once on a fresh system, silent on every re-run.
+    #
+    # ── WHY ignore_errors: true IS REQUIRED ─────────────────────────────────
+    #
+    # Without ignore_errors: true, a failed install causes Ansible to halt
+    # the play immediately. The warning task that follows is never reached
+    # and the operator sees only a generic play failure, not the diagnostic
+    # message. ignore_errors: true allows execution to continue so the warning
+    # task can surface the failure with actionable context.
+    #
+    # IMPORTANT: ignore_errors does not suppress the failure mark.
+    # The install task is still reported as FAILED in the play summary.
+    # ignore_errors only controls whether the play halts — not whether
+    # the task outcome is recorded correctly.
+    #
+    # ── WHY failed_when IS STRUCTURED THIS WAY ──────────────────────────────
+    #
+    # When creates: triggers (Cursor already installed), Ansible skips the
+    # shell block entirely and cursor_install_result is never populated.
+    # Checking cursor_install_result.rc directly on a re-run would raise:
+    #   "undefined variable: cursor_install_result"
+    #
+    # The two-condition failed_when guards against this:
+    #   Condition 1: rc is defined   → false on skip, short-circuits safely
+    #   Condition 2: rc != 0         → evaluated only when rc exists
+    #
+    # Result:
+    #   Fresh install, success:   rc defined, rc == 0  → task passes
+    #   Fresh install, failure:   rc defined, rc != 0  → task marked failed
+    #   Already installed (skip): rc undefined          → task passes silently
+    #
+    # ── WHY A POST-INSTALL VERIFICATION TASK ────────────────────────────────
+    #
+    # The install task uses ignore_errors: true so a failure does not halt
+    # the play. Without a verification step, a failed install produces a
+    # warning message but provisioning continues and the student ends up with
+    # a workstation that is missing Cursor — with no further signal.
+    #
+    # The verification task runs cursor --version and registers the output.
+    # The debug task that follows reports the installed version on success,
+    # making the play summary self-documenting. On failure, the warning task
+    # already surfaced the diagnostic; the verification output adds the
+    # explicit confirmation that the binary is absent.
+    #
+    # ── FUTURE IMPROVEMENT — full apt lifecycle ──────────────────────────────
+    #
+    # Once Cursor publishes a stable, documented apt repository (as VS Code
+    # and Brave do), replace this entire section with the standard three-task
+    # pattern:
+    #   1. Add GPG key  →  /etc/apt/keyrings/cursor.gpg
+    #   2. Add repo     →  ansible.builtin.apt_repository
+    #   3. Install      →  ansible.builtin.apt: name=cursor state=present
+    #
+    # That eliminates all shell scripting and gives full apt lifecycle
+    # management. Monitor https://www.cursor.com/changelog for the
+    # announcement. A community forum post from August 2025 indicates this
+    # is on their roadmap.
+    #
+    # ── ARCHITECTURE DEPENDENCY NOTE ────────────────────────────────────────
+    #
+    # This section targets linux-x64 explicitly in the API query parameter.
+    # If the playbook is ever extended to arm64 hosts, add a when: condition
+    # on each task and duplicate the block with platform=linux-arm64.
+    # Do not attempt to make the platform value dynamic inside the shell
+    # block — keep it explicit and readable.
+    # ==========================================================================
+
+    # ==========================================================================
+    # SECTION 15 — CURSOR IDE
+    # ==========================================================================
+    #
+    # ── WHY THIS IMPLEMENTATION ───────────────────────────────────────────────
+    #
+    # The previous implementation used a shell block that combined:
+    #   1. API fetch
+    #   2. JSON parsing
+    #   3. .deb download
+    #   4. apt install
+    #
+    # into one opaque task. If it stalled, Ansible could only show that the
+    # shell task was still running, without revealing whether the delay was in
+    # the HTTP request, the package download, apt lock waiting, or dpkg
+    # unpack/configure.
+    #
+    # This implementation replaces that shell block with native Ansible tasks:
+    #   - uri       → fetch JSON metadata from Cursor API
+    #   - set_fact  → parse .deb URL and version
+    #   - get_url   → download the .deb explicitly
+    #   - apt       → install the downloaded package with lock waiting
+    #   - command   → verify the binary after installation
+    #
+    # Result:
+    #   - clearer task-level visibility
+    #   - easier debugging
+    #   - no jq dependency
+    #   - no silent shell hang
+    #
+    # ── WHY xz-utils IS INCLUDED ──────────────────────────────────────────────
+    #
+    # Ansible's apt module may rely on xz-utils when inspecting/installing
+    # .deb packages. On minimal Debian systems, installing it explicitly avoids
+    # a fragile edge case during package handling.
+    #
+    # ── ARCHITECTURE NOTE ─────────────────────────────────────────────────────
+    #
+    # This block targets linux-x64 explicitly. If arm64 support is added later,
+    # duplicate the block with platform=linux-arm64 and gate each branch with
+    # an explicit when: on ansible_architecture.
+    # ==========================================================================
+
+    - name: "[cursor] Check whether Cursor binary already exists"
+      ansible.builtin.stat:
+        path: /usr/bin/cursor
+      register: cursor_binary_stat
+
+    - name: "[cursor] Ensure package helper for .deb handling is present"
+      ansible.builtin.apt:
+        name: xz-utils
+        state: present
+        update_cache: false
+        lock_timeout: 300
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Fetch Cursor download metadata"
+      ansible.builtin.uri:
+        url: "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
+        method: GET
+        return_content: true
+        status_code: 200
+        timeout: 30
+      register: cursor_api_response
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Parse Cursor metadata"
+      ansible.builtin.set_fact:
+        cursor_api_json: "{{ cursor_api_response.content | from_json }}"
+        cursor_deb_url: "{{ (cursor_api_response.content | from_json).debUrl }}"
+        cursor_expected_version: "{{ (cursor_api_response.content | from_json).version }}"
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Validate Cursor deb URL from API"
+      ansible.builtin.assert:
+        that:
+          - cursor_deb_url is defined
+          - cursor_deb_url is string
+          - cursor_deb_url | length > 0
+          - cursor_deb_url != "null"
+          - cursor_deb_url is match('^https://')
+        fail_msg: >-
+          Cursor API did not return a valid debUrl.
+          Raw response: {{ cursor_api_response.content | default('<no content>') }}
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Download Cursor Debian package"
+      ansible.builtin.get_url:
+        url: "{{ cursor_deb_url }}"
+        dest: /tmp/cursor.deb
+        mode: "0644"
+        timeout: 300
+        force: true
+      register: cursor_download_result
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Install Cursor IDE from downloaded .deb"
+      ansible.builtin.apt:
+        deb: /tmp/cursor.deb
+        state: present
+        force_apt_get: true
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: cursor_install_result
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Remove downloaded package"
+      ansible.builtin.file:
+        path: /tmp/cursor.deb
+        state: absent
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Verify Cursor IDE binary"
+      ansible.builtin.command:
+        cmd: cursor --version
+      register: cursor_version_result
+      changed_when: false
+      failed_when: false
+
+    - name: "[cursor] Fail if Cursor binary is still missing"
+      ansible.builtin.fail:
+        msg: >-
+          Cursor installation did not complete successfully.
+          API version: {{ cursor_expected_version | default('unknown') }}
+          Download URL: {{ cursor_deb_url | default('unknown') }}
+          Install rc: {{ cursor_install_result.rc | default('n/a') }}
+          stdout: {{ cursor_install_result.stdout | default('') }}
+          stderr: {{ cursor_install_result.stderr | default('') }}
+      when: cursor_version_result.rc != 0
+
+    - name: "[cursor] Report installed Cursor version"
+      ansible.builtin.debug:
+        msg: "✓ Cursor IDE installed — {{ cursor_version_result.stdout | trim }}"
+
+
+
     # ==========================================================================
     # SECTION 6 — KVM VIRTUALISATION TOOLS
     # Only on bare metal or nested inside a KVM guest.
@@ -802,287 +1087,7 @@
         state: present
         update_cache: true
 
-    # ==========================================================================
-    # SECTION 15 — CURSOR IDE
-    # ==========================================================================
-    #
-    # ── PACKAGING SITUATION ──────────────────────────────────────────────────
-    #
-    # VS Code and Brave publish stable apt repositories. Add the repo once,
-    # run apt install, and apt handles the full lifecycle: install, upgrade,
-    # removal. That is the correct Linux packaging story.
-    #
-    # Cursor does not yet offer a pre-configured apt repo. Their .deb package
-    # registers a Cursor-managed apt source on FIRST APPLICATION LAUNCH — not
-    # on installation. During automated provisioning (headless, no GUI, no
-    # first launch) that repo does not yet exist, so apt upgrade has nothing
-    # to pull from.
-    #
-    # This is a deliberate Cursor packaging decision, not a bug. It is common
-    # among commercial Electron apps that manage their own update channels.
-    # The implementation below works within this constraint correctly.
-    #
-    # ── WHY THE API ENDPOINT, NOT A HARDCODED URL ────────────────────────────
-    #
-    # The prior implementation used a hardcoded download URL:
-    #   curl "https://downloader.cursor.sh/linux/nspkg/x64"
-    #
-    # That domain was decommissioned in early 2026. Every script that had
-    # that URL hardcoded broke on the same day with:
-    #   curl: (6) Could not resolve host
-    # No deprecation warning. No redirect. Silent failure on next provision.
-    #
-    # Cursor exposes a stable download API:
-    #   https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable
-    #
-    # The response is JSON:
-    #   {
-    #     "downloadUrl": "...Cursor-3.x.y-x86_64.AppImage",
-    #     "debUrl":      "...cursor_3.x.y_amd64.deb",
-    #     "rpmUrl":      "...cursor-3.x.y.el8.x86_64.rpm",
-    #     "version":     "3.x.y",
-    #     "commitSha":   "abc123..."
-    #   }
-    #
-    # The API contract is stable. The file URLs it returns change with every
-    # release. This playbook always fetches the current version with zero
-    # maintenance — no URL to update, no version to pin.
-    #
-    # ── WHY .debUrl AND NOT .downloadUrl ─────────────────────────────────────
-    #
-    # .downloadUrl  →  AppImage (self-contained bundle)
-    # .debUrl       →  Debian package
-    #
-    # AppImage is wrong here for three reasons:
-    #   1. No system integration by default — no /usr/bin entry, no .desktop
-    #      launcher, no apt lifecycle.
-    #   2. Requires FUSE2 to run; Debian 13 has FUSE2 compatibility issues
-    #      with certain AppImages.
-    #   3. Students would never receive updates through normal apt upgrade.
-    #
-    # The .deb installs to standard FHS paths (/usr/bin/cursor), creates a
-    # .desktop launcher, and registers the Cursor apt repository for future
-    # updates once the application has been launched once.
-    #
-    # ── WHY jq IS A DECLARED PREREQUISITE ───────────────────────────────────
-    #
-    # The install shell block pipes the API response through jq to extract
-    # .debUrl. If jq is absent, the pipe fails immediately with:
-    #   /bin/sh: jq: command not found
-    # Because set -euo pipefail is active, this exits non-zero and the error
-    # message gives no indication that a missing tool is the cause.
-    #
-    # The prerequisite task below installs jq explicitly via apt before the
-    # shell block runs. jq is in the standard Debian repos; this adds one
-    # idempotent apt task with no side effects.
-    #
-    # ── WHY creates: /usr/bin/cursor ────────────────────────────────────────
-    #
-    # creates: is Ansible's idempotency guard for shell tasks. If the path
-    # exists, the entire block is skipped without executing a single line.
-    # /usr/bin/cursor is the binary path installed by the Cursor .deb —
-    # verified against the actual package contents. This makes the install
-    # a true one-shot: runs once on a fresh system, silent on every re-run.
-    #
-    # ── WHY ignore_errors: true IS REQUIRED ─────────────────────────────────
-    #
-    # Without ignore_errors: true, a failed install causes Ansible to halt
-    # the play immediately. The warning task that follows is never reached
-    # and the operator sees only a generic play failure, not the diagnostic
-    # message. ignore_errors: true allows execution to continue so the warning
-    # task can surface the failure with actionable context.
-    #
-    # IMPORTANT: ignore_errors does not suppress the failure mark.
-    # The install task is still reported as FAILED in the play summary.
-    # ignore_errors only controls whether the play halts — not whether
-    # the task outcome is recorded correctly.
-    #
-    # ── WHY failed_when IS STRUCTURED THIS WAY ──────────────────────────────
-    #
-    # When creates: triggers (Cursor already installed), Ansible skips the
-    # shell block entirely and cursor_install_result is never populated.
-    # Checking cursor_install_result.rc directly on a re-run would raise:
-    #   "undefined variable: cursor_install_result"
-    #
-    # The two-condition failed_when guards against this:
-    #   Condition 1: rc is defined   → false on skip, short-circuits safely
-    #   Condition 2: rc != 0         → evaluated only when rc exists
-    #
-    # Result:
-    #   Fresh install, success:   rc defined, rc == 0  → task passes
-    #   Fresh install, failure:   rc defined, rc != 0  → task marked failed
-    #   Already installed (skip): rc undefined          → task passes silently
-    #
-    # ── WHY A POST-INSTALL VERIFICATION TASK ────────────────────────────────
-    #
-    # The install task uses ignore_errors: true so a failure does not halt
-    # the play. Without a verification step, a failed install produces a
-    # warning message but provisioning continues and the student ends up with
-    # a workstation that is missing Cursor — with no further signal.
-    #
-    # The verification task runs cursor --version and registers the output.
-    # The debug task that follows reports the installed version on success,
-    # making the play summary self-documenting. On failure, the warning task
-    # already surfaced the diagnostic; the verification output adds the
-    # explicit confirmation that the binary is absent.
-    #
-    # ── FUTURE IMPROVEMENT — full apt lifecycle ──────────────────────────────
-    #
-    # Once Cursor publishes a stable, documented apt repository (as VS Code
-    # and Brave do), replace this entire section with the standard three-task
-    # pattern:
-    #   1. Add GPG key  →  /etc/apt/keyrings/cursor.gpg
-    #   2. Add repo     →  ansible.builtin.apt_repository
-    #   3. Install      →  ansible.builtin.apt: name=cursor state=present
-    #
-    # That eliminates all shell scripting and gives full apt lifecycle
-    # management. Monitor https://www.cursor.com/changelog for the
-    # announcement. A community forum post from August 2025 indicates this
-    # is on their roadmap.
-    #
-    # ── ARCHITECTURE DEPENDENCY NOTE ────────────────────────────────────────
-    #
-    # This section targets linux-x64 explicitly in the API query parameter.
-    # If the playbook is ever extended to arm64 hosts, add a when: condition
-    # on each task and duplicate the block with platform=linux-arm64.
-    # Do not attempt to make the platform value dynamic inside the shell
-    # block — keep it explicit and readable.
-    # ==========================================================================
 
-    # ==========================================================================
-    # SECTION 15 — CURSOR IDE
-    # ==========================================================================
-    #
-    # ── WHY THIS IMPLEMENTATION ───────────────────────────────────────────────
-    #
-    # The previous implementation used a shell block that combined:
-    #   1. API fetch
-    #   2. JSON parsing
-    #   3. .deb download
-    #   4. apt install
-    #
-    # into one opaque task. If it stalled, Ansible could only show that the
-    # shell task was still running, without revealing whether the delay was in
-    # the HTTP request, the package download, apt lock waiting, or dpkg
-    # unpack/configure.
-    #
-    # This implementation replaces that shell block with native Ansible tasks:
-    #   - uri       → fetch JSON metadata from Cursor API
-    #   - set_fact  → parse .deb URL and version
-    #   - get_url   → download the .deb explicitly
-    #   - apt       → install the downloaded package with lock waiting
-    #   - command   → verify the binary after installation
-    #
-    # Result:
-    #   - clearer task-level visibility
-    #   - easier debugging
-    #   - no jq dependency
-    #   - no silent shell hang
-    #
-    # ── WHY xz-utils IS INCLUDED ──────────────────────────────────────────────
-    #
-    # Ansible's apt module may rely on xz-utils when inspecting/installing
-    # .deb packages. On minimal Debian systems, installing it explicitly avoids
-    # a fragile edge case during package handling.
-    #
-    # ── ARCHITECTURE NOTE ─────────────────────────────────────────────────────
-    #
-    # This block targets linux-x64 explicitly. If arm64 support is added later,
-    # duplicate the block with platform=linux-arm64 and gate each branch with
-    # an explicit when: on ansible_architecture.
-    # ==========================================================================
-
-    - name: "[cursor] Check whether Cursor binary already exists"
-      ansible.builtin.stat:
-        path: /usr/bin/cursor
-      register: cursor_binary_stat
-
-    - name: "[cursor] Ensure package helper for .deb handling is present"
-      ansible.builtin.apt:
-        name: xz-utils
-        state: present
-        update_cache: false
-        lock_timeout: 300
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Fetch Cursor download metadata"
-      ansible.builtin.uri:
-        url: "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
-        method: GET
-        return_content: true
-        status_code: 200
-        timeout: 30
-      register: cursor_api_response
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Parse Cursor metadata"
-      ansible.builtin.set_fact:
-        cursor_api_json: "{{ cursor_api_response.content | from_json }}"
-        cursor_deb_url: "{{ (cursor_api_response.content | from_json).debUrl }}"
-        cursor_expected_version: "{{ (cursor_api_response.content | from_json).version }}"
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Validate Cursor deb URL from API"
-      ansible.builtin.assert:
-        that:
-          - cursor_deb_url is defined
-          - cursor_deb_url is string
-          - cursor_deb_url | length > 0
-          - cursor_deb_url != "null"
-          - cursor_deb_url is match('^https://')
-        fail_msg: >-
-          Cursor API did not return a valid debUrl.
-          Raw response: {{ cursor_api_response.content | default('<no content>') }}
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Download Cursor Debian package"
-      ansible.builtin.get_url:
-        url: "{{ cursor_deb_url }}"
-        dest: /tmp/cursor.deb
-        mode: "0644"
-        timeout: 300
-        force: true
-      register: cursor_download_result
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Install Cursor IDE from downloaded .deb"
-      ansible.builtin.apt:
-        deb: /tmp/cursor.deb
-        state: present
-        force_apt_get: true
-        lock_timeout: 300
-      environment:
-        DEBIAN_FRONTEND: noninteractive
-      register: cursor_install_result
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Remove downloaded package"
-      ansible.builtin.file:
-        path: /tmp/cursor.deb
-        state: absent
-      when: not cursor_binary_stat.stat.exists
-
-    - name: "[cursor] Verify Cursor IDE binary"
-      ansible.builtin.command:
-        cmd: cursor --version
-      register: cursor_version_result
-      changed_when: false
-      failed_when: false
-
-    - name: "[cursor] Fail if Cursor binary is still missing"
-      ansible.builtin.fail:
-        msg: >-
-          Cursor installation did not complete successfully.
-          API version: {{ cursor_expected_version | default('unknown') }}
-          Download URL: {{ cursor_deb_url | default('unknown') }}
-          Install rc: {{ cursor_install_result.rc | default('n/a') }}
-          stdout: {{ cursor_install_result.stdout | default('') }}
-          stderr: {{ cursor_install_result.stderr | default('') }}
-      when: cursor_version_result.rc != 0
-
-    - name: "[cursor] Report installed Cursor version"
-      ansible.builtin.debug:
-        msg: "✓ Cursor IDE installed — {{ cursor_version_result.stdout | trim }}"
 
     # ==========================================================================
     # SECTION 16 — SHELL ENVIRONMENT AND GIT CONFIGURATION
