@@ -949,62 +949,140 @@
     # block — keep it explicit and readable.
     # ==========================================================================
 
-    - name: "[cursor] Ensure jq is present for API response parsing"
+    # ==========================================================================
+    # SECTION 15 — CURSOR IDE
+    # ==========================================================================
+    #
+    # ── WHY THIS IMPLEMENTATION ───────────────────────────────────────────────
+    #
+    # The previous implementation used a shell block that combined:
+    #   1. API fetch
+    #   2. JSON parsing
+    #   3. .deb download
+    #   4. apt install
+    #
+    # into one opaque task. If it stalled, Ansible could only show that the
+    # shell task was still running, without revealing whether the delay was in
+    # the HTTP request, the package download, apt lock waiting, or dpkg
+    # unpack/configure.
+    #
+    # This implementation replaces that shell block with native Ansible tasks:
+    #   - uri       → fetch JSON metadata from Cursor API
+    #   - set_fact  → parse .deb URL and version
+    #   - get_url   → download the .deb explicitly
+    #   - apt       → install the downloaded package with lock waiting
+    #   - command   → verify the binary after installation
+    #
+    # Result:
+    #   - clearer task-level visibility
+    #   - easier debugging
+    #   - no jq dependency
+    #   - no silent shell hang
+    #
+    # ── WHY xz-utils IS INCLUDED ──────────────────────────────────────────────
+    #
+    # Ansible's apt module may rely on xz-utils when inspecting/installing
+    # .deb packages. On minimal Debian systems, installing it explicitly avoids
+    # a fragile edge case during package handling.
+    #
+    # ── ARCHITECTURE NOTE ─────────────────────────────────────────────────────
+    #
+    # This block targets linux-x64 explicitly. If arm64 support is added later,
+    # duplicate the block with platform=linux-arm64 and gate each branch with
+    # an explicit when: on ansible_architecture.
+    # ==========================================================================
+
+    - name: "[cursor] Check whether Cursor binary already exists"
+      ansible.builtin.stat:
+        path: /usr/bin/cursor
+      register: cursor_binary_stat
+
+    - name: "[cursor] Ensure package helper for .deb handling is present"
       ansible.builtin.apt:
-        name: jq
+        name: xz-utils
         state: present
         update_cache: false
+        lock_timeout: 300
+      when: not cursor_binary_stat.stat.exists
 
-    - name: "[cursor] Install Cursor IDE via Debian package"
-      ansible.builtin.shell:
-        cmd: |
-          set -euo pipefail
+    - name: "[cursor] Fetch Cursor download metadata"
+      ansible.builtin.uri:
+        url: "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
+        method: GET
+        return_content: true
+        status_code: 200
+        timeout: 30
+      register: cursor_api_response
+      when: not cursor_binary_stat.stat.exists
 
-          DEB_URL=$(curl -fsSL \
-            "https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable" \
-            | jq -r '.debUrl')
+    - name: "[cursor] Parse Cursor metadata"
+      ansible.builtin.set_fact:
+        cursor_api_json: "{{ cursor_api_response.content | from_json }}"
+        cursor_deb_url: "{{ (cursor_api_response.content | from_json).debUrl }}"
+        cursor_expected_version: "{{ (cursor_api_response.content | from_json).version }}"
+      when: not cursor_binary_stat.stat.exists
 
-          if [ -z "$DEB_URL" ] || [ "$DEB_URL" = "null" ]; then
-            echo "ERROR: .debUrl was empty or null in Cursor API response"
-            exit 1
-          fi
+    - name: "[cursor] Validate Cursor deb URL from API"
+      ansible.builtin.assert:
+        that:
+          - cursor_deb_url is defined
+          - cursor_deb_url is string
+          - cursor_deb_url | length > 0
+          - cursor_deb_url != "null"
+          - cursor_deb_url is match('^https://')
+        fail_msg: >-
+          Cursor API did not return a valid debUrl.
+          Raw response: {{ cursor_api_response.content | default('<no content>') }}
+      when: not cursor_binary_stat.stat.exists
 
-          curl -fsSL "$DEB_URL" -o /tmp/cursor.deb
-          apt-get install -y /tmp/cursor.deb
-          rm -f /tmp/cursor.deb
-        creates: /usr/bin/cursor
+    - name: "[cursor] Download Cursor Debian package"
+      ansible.builtin.get_url:
+        url: "{{ cursor_deb_url }}"
+        dest: /tmp/cursor.deb
+        mode: "0644"
+        timeout: 300
+        force: true
+      register: cursor_download_result
+      when: not cursor_binary_stat.stat.exists
+
+    - name: "[cursor] Install Cursor IDE from downloaded .deb"
+      ansible.builtin.apt:
+        deb: /tmp/cursor.deb
+        state: present
+        force_apt_get: true
+        lock_timeout: 300
+      environment:
+        DEBIAN_FRONTEND: noninteractive
       register: cursor_install_result
-      ignore_errors: true
-      failed_when:
-        - cursor_install_result.rc is defined
-        - cursor_install_result.rc != 0
+      when: not cursor_binary_stat.stat.exists
 
-    - name: "[cursor] Warn if Cursor IDE install failed"
-      ansible.builtin.debug:
-        msg:
-          - "⚠  Cursor IDE install failed — binary not present at /usr/bin/cursor."
-          - "   Diagnose the API response:"
-          - "     curl https://www.cursor.com/api/download?platform=linux-x64&releaseTrack=stable"
-          - "   Manual install: https://www.cursor.com/downloads"
-      when:
-        - cursor_install_result.rc is defined
-        - cursor_install_result.rc != 0
+    - name: "[cursor] Remove downloaded package"
+      ansible.builtin.file:
+        path: /tmp/cursor.deb
+        state: absent
+      when: not cursor_binary_stat.stat.exists
 
-    - name: "[cursor] Verify Cursor IDE binary and report installed version"
+    - name: "[cursor] Verify Cursor IDE binary"
       ansible.builtin.command:
         cmd: cursor --version
       register: cursor_version_result
       changed_when: false
       failed_when: false
-      when: cursor_install_result.rc is not defined or cursor_install_result.rc == 0
+
+    - name: "[cursor] Fail if Cursor binary is still missing"
+      ansible.builtin.fail:
+        msg: >-
+          Cursor installation did not complete successfully.
+          API version: {{ cursor_expected_version | default('unknown') }}
+          Download URL: {{ cursor_deb_url | default('unknown') }}
+          Install rc: {{ cursor_install_result.rc | default('n/a') }}
+          stdout: {{ cursor_install_result.stdout | default('') }}
+          stderr: {{ cursor_install_result.stderr | default('') }}
+      when: cursor_version_result.rc != 0
 
     - name: "[cursor] Report installed Cursor version"
       ansible.builtin.debug:
-        msg: "✓  Cursor IDE installed — {{ cursor_version_result.stdout | trim }}"
-      when:
-        - cursor_version_result is defined
-        - cursor_version_result.rc is defined
-        - cursor_version_result.rc == 0
+        msg: "✓ Cursor IDE installed — {{ cursor_version_result.stdout | trim }}"
 
     # ==========================================================================
     # SECTION 16 — SHELL ENVIRONMENT AND GIT CONFIGURATION
